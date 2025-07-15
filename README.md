@@ -4,17 +4,13 @@
 
 <p style="text-align: center">A progressive <a href="https://php.net">PHP</a> framework for building effecient and scalable server-side applications.</p>
 
-Thanks — based on the new structure, the `config/queues.php` file now explicitly separates **drivers** and **connections**, allowing multiple queue backends to coexist cleanly. Here's the updated `README.md` reflecting this new structure:
 
----
-
-````markdown
 # AssegaiPHP RabbitMQ Queue Integration
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![AssegaiPHP](https://img.shields.io/badge/built%20for-AssegaiPHP-forestgreen)](https://github.com/assegaiphp/framework)
 
-This package provides **RabbitMQ queue support** for the [AssegaiPHP](https://github.com/assegaiphp/framework) framework. It enables asynchronous job handling using AMQP through PhpAmqpLib.
+This package provides **RabbitMQ queue support** for the [AssegaiPHP](https://assegaiphp.com/) framework. It enables asynchronous job handling using AMQP through PhpAmqpLib.
 
 ---
 
