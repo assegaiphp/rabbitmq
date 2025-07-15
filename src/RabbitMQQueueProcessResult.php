@@ -1,6 +1,6 @@
 <?php
 
-namespace Assegaiphp\Rabbitmq;
+namespace Assegai\Rabbitmq;
 
 use Assegai\Common\Interfaces\Queues\QueueProcessResultInterface;
 use Throwable;
