@@ -15,7 +15,7 @@ use Throwable;
 class RabbitMQQueueProcessResult implements QueueProcessResultInterface
 {
   /**
-   * QueueProcessResult constructor.
+   * RabbitMQQueueProcessResult constructor.
    *
    * @param mixed $data The result data of processing the job.
    * @param array $errors An array of errors encountered during processing.
