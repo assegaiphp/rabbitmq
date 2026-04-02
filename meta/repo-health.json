@@ -1,0 +1,15 @@
+{
+  "repository": "assegaiphp/rabbitmq",
+  "package": "assegaiphp/rabbitmq",
+  "php": ">=8.3",
+  "license": "MIT",
+  "ci": {
+    "workflow": "php.yml",
+    "label": "tests"
+  },
+  "status": {
+    "label": "active",
+    "color": "10b981",
+    "summary": "RabbitMQ queue driver with local unit coverage for publish and process flows."
+  }
+}

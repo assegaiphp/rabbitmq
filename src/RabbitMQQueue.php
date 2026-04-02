@@ -177,12 +177,12 @@ class RabbitMQQueue implements QueueInterface
    */
   public static function create(array $config): self
   {
-    $name ??= $config['name'] ?? throw new QueueException('Queue name is required.');
+    $name = $config['name'] ?? throw new QueueException('Queue name is required.');
     if (!is_string($name)) {
       throw new QueueException('Queue name must be a string.');
     }
 
-    return new self(
+    return new static(
       $name,
       $config['host'] ?? null,
       $config['port'] ?? RabbitMQQueue::DEFAULT_PORT,
