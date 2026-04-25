@@ -2,15 +2,27 @@
     <a href="https://assegaiphp.com/" target="blank"><img src="https://assegaiphp.com/images/logos/logo-cropped.png" width="200" alt="Assegai Logo"></a>
 </div>
 
-<p align="center">A progressive PHP framework for building efficient and scalable web applications.</p>
+<p align="center">
+  <a href="https://github.com/assegaiphp/rabbitmq/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/assegaiphp/rabbitmq?display_name=tag&sort=semver&style=flat-square"></a>
+  <a href="https://github.com/assegaiphp/rabbitmq/actions/workflows/php.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/assegaiphp/rabbitmq/php.yml?branch=main&label=tests&style=flat-square"></a>
+  <img alt="PHP 8.4+" src="https://img.shields.io/badge/PHP-8.4%2B-777BB4?style=flat-square&logo=php&logoColor=white">
+  <a href="https://github.com/assegaiphp/rabbitmq/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/assegaiphp/rabbitmq?style=flat-square"></a>
+  <img alt="Status active" src="https://img.shields.io/badge/status-active-10b981?style=flat-square">
+</p>
 
+<p align="center">RabbitMQ queue driver for AssegaiPHP applications.</p>
 
 # AssegaiPHP RabbitMQ Queue Integration
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![AssegaiPHP](https://img.shields.io/badge/built%20for-AssegaiPHP-forestgreen)](https://github.com/assegaiphp/framework)
-
 This package provides **RabbitMQ queue support** for the [AssegaiPHP](https://assegaiphp.com/) framework. It enables asynchronous job handling using AMQP through PhpAmqpLib.
+
+---
+
+## Contribution workflow
+
+For commit and pull request conventions in this repo, see:
+
+- [docs/commit-and-pr-guidelines.md](./docs/commit-and-pr-guidelines.md)
 
 ---
 
@@ -20,13 +32,50 @@ Install via Composer:
 
 ```bash
 composer require assegaiphp/rabbitmq
-````
+```
 
-Or use the Assegai CLI:
+### RabbitMQ extension requirement
+
+This package currently requires the PHP `amqp` extension.
+
+If Composer stops with an error like this:
+
+```text
+Root composer.json requires PHP extension ext-amqp * but it is missing from your system.
+```
+
+the problem is usually your local PHP CLI setup, not RabbitMQ itself.
+
+Check the PHP environment Composer is using:
 
 ```bash
-assegai add rabbitmq
+php --ini
+php -m | grep amqp
 ```
+
+If `amqp` is missing, install or enable it for the same PHP version that runs Composer.
+
+On Debian or Ubuntu, that is often:
+
+```bash
+sudo apt install php-amqp
+```
+
+or a version-specific package such as:
+
+```bash
+sudo apt install php8.5-amqp
+```
+
+If your distribution does not provide a package yet, `pecl` is often the fallback:
+
+```bash
+sudo pecl install amqp
+```
+
+After that, confirm the extension is loaded with `php -m | grep amqp` and rerun Composer.
+
+Avoid installing with `--ignore-platform-req=ext-amqp` for normal development. That bypasses Composer's check, but it does not make the extension available at runtime.
 
 ---
 
@@ -37,9 +86,11 @@ Update your application's `config/queues.php` file to register the RabbitMQ driv
 ```php
 <?php
 
+use Assegai\Rabbitmq\RabbitMQQueue;
+
 return [
   'drivers' => [
-    'rabbitmq' => 'Assegai\\RabbitMQ\\RabbitMQQueue'
+    'rabbitmq' => RabbitMQQueue::class,
   ],
   'connections' => [
     'rabbitmq' => [
@@ -75,16 +126,19 @@ return [
 Inject the queue connection using the `#[InjectQueue]` attribute:
 
 ```php
+use Assegai\Common\Interfaces\Queues\QueueInterface;
+use Assegai\Core\Attributes\Injectable;
 use Assegai\Core\Queues\Attributes\InjectQueue;
-use Assegai\Core\Queues\Interfaces\QueueInterface;
 
+#[Injectable]
 readonly class NotificationsService
 {
   public function __construct(
     #[InjectQueue('rabbitmq.notifications')] private QueueInterface $queue
-  ) {}
+  ) {
+  }
 
-  public function send(array $payload): void
+  public function send(object $payload): void
   {
     $this->queue->add($payload);
   }
@@ -95,52 +149,64 @@ readonly class NotificationsService
 
 ### Consuming Jobs
 
-Define a consumer class with the `#[Processor]` attribute:
+Define an injectable processor class for the queue:
 
 ```php
-use Assegai\Core\Queues\Attributes\Processor;
-use Assegai\Core\Queues\WorkerHost;
-use Assegai\Core\Queues\QueueProcessResult;
-use Assegai\Core\Queues\Interfaces\QueueProcessResultInterface;
+use Assegai\Core\Attributes\Injectable;
+use Assegai\Core\Queues\Attributes\QueueProcessor;
 
-#[Processor('rabbitmq.notifications')]
-class NotificationsConsumer extends WorkerHost
+#[Injectable]
+#[QueueProcessor('rabbitmq.notifications')]
+final class NotificationsProcessor
 {
-  public function process(callable $callback): QueueProcessResultInterface
+  public function process(object $job): void
   {
-    $job = $callback();
-    $data = $job->data;
-
-    echo "Processing notification: {$data->message}" . PHP_EOL;
-
-    return new QueueProcessResult(data: ['status' => 'done'], job: $job);
+    // Handle the job here.
+    // For example: send an email, call another service, or write to the database.
   }
 }
 ```
 
-> ⚠️ Do **not** use `#[Injectable]` on consumers. The `process()` method must accept a `callable` and return a `QueueProcessResultInterface`.
+Register that processor in your module's provider list so the CLI can discover it.
+
+If you want a starter file instead of writing the class from scratch, you can scaffold one with:
+
+```bash
+assegai g qp notifications --queue=rabbitmq.notifications
+```
+
+If you already know the job class you want to handle, you can type the generated `process(...)` method too:
+
+```bash
+assegai g qp notifications --queue=rabbitmq.notifications --job=Jobs/NotificationJob
+```
+
+If the feature already has a local `Jobs` folder, you can also use a bare job name:
+
+```bash
+assegai g qp notifications --queue=rabbitmq.notifications --job=notification-job
+```
 
 ---
 
 ### Running the Worker
 
-If you have the Assegai CLI installed simply run the queue worker with:
+Use the Assegai queue commands to discover and run processors:
 
 ```bash
-assegai queue:work
+assegai queue:list
+assegai queue:work rabbitmq.notifications
 ```
 
-This will automatically load and execute all consumer classes registered with the `#[Processor]` attribute.
-
-You can also run a specific consumer directly:
+If you want to process one job and exit, use:
 
 ```bash
-assegai queue:work --consumer=NotificationsConsumer
+assegai queue:work rabbitmq.notifications --once
 ```
 
-This will start the worker for the `NotificationsConsumer` class, processing jobs from the `rabbitmq.notifications` queue.
+If more than one processor is registered for the same queue, pass `--processor` to pick one explicitly.
 
-For more information on running workers, refer to the [AssegaiPHP documentation](https://assegaiphp.com/guide/techniques/queues).
+For more information on running workers, refer to the [AssegaiPHP queue guide](https://assegaiphp.com/guide/advanced-topics/queues-and-background-jobs).
 
 ---
 
