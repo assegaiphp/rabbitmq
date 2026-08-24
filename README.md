@@ -55,6 +55,15 @@ php -m | grep amqp
 
 If `amqp` is missing, install or enable it for the same PHP version that runs Composer.
 
+## Compatibility
+
+| RabbitMQ package | AssegaiPHP Common |
+| --- | --- |
+| `1.1.x` | `^0.10.0` |
+| `1.0.x` | `^0.9.0` |
+
+Applications moving to the AssegaiPHP 0.10 release line should upgrade this package and the coordinated first-party dependencies together.
+
 On Debian or Ubuntu, that is often:
 
 ```bash
