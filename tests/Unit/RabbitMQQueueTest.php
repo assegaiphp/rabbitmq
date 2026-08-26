@@ -148,7 +148,7 @@ final class RabbitMQQueueTest extends TestCase
     $channel->method('basic_get')->willReturn($message);
 
     $queue = new TestRabbitMQQueue();
-    $queue->prime('emails', $connection, $channel);
+    $queue->prime('emails', $connection, $channel, totalJobs: 1);
 
     $result = $queue->process(static function (RabbitMQTestJob $job): never {
       throw new \TypeError('processor contract failed');
@@ -158,6 +158,47 @@ final class RabbitMQQueueTest extends TestCase
     self::assertInstanceOf(QueueException::class, $result->getNextError());
     self::assertInstanceOf(\TypeError::class, $result->getNextError()?->getPrevious());
     self::assertInstanceOf(RabbitMQTestJob::class, $result->getJob());
+    self::assertSame(1, $queue->getTotalJobs());
+  }
+
+  public function testProcessDecrementsTheJobCountWhenAFailedDeliveryIsDiscarded(): void
+  {
+    $connection = $this->getMockBuilder(AMQPStreamConnection::class)->disableOriginalConstructor()->onlyMethods(['close'])->getMock();
+    $channel = $this->getMockBuilder(AMQPChannel::class)->disableOriginalConstructor()->onlyMethods(['basic_get'])->getMock();
+    $message = $this->getMockBuilder(AMQPMessage::class)->onlyMethods(['getBody', 'ack', 'nack'])->getMock();
+
+    $message->method('getBody')->willReturn('{invalid-json');
+    $message->expects($this->never())->method('ack');
+    $message->expects($this->once())->method('nack')->with(false);
+    $channel->method('basic_get')->willReturn($message);
+
+    $queue = new TestRabbitMQQueue();
+    $queue->prime('emails', $connection, $channel, totalJobs: 1, requeueOnFailure: false);
+
+    $result = $queue->process(static fn (RabbitMQTestJob $job): null => null);
+
+    self::assertTrue($result->isError());
+    self::assertSame(0, $queue->getTotalJobs());
+  }
+
+  public function testProcessDecrementsTheJobCountWhenAutoAcknowledgementPrecedesFailure(): void
+  {
+    $connection = $this->getMockBuilder(AMQPStreamConnection::class)->disableOriginalConstructor()->onlyMethods(['close'])->getMock();
+    $channel = $this->getMockBuilder(AMQPChannel::class)->disableOriginalConstructor()->onlyMethods(['basic_get'])->getMock();
+    $message = $this->getMockBuilder(AMQPMessage::class)->onlyMethods(['getBody', 'ack', 'nack'])->getMock();
+
+    $message->method('getBody')->willReturn('{invalid-json');
+    $message->expects($this->never())->method('ack');
+    $message->expects($this->never())->method('nack');
+    $channel->expects($this->once())->method('basic_get')->with('emails', true)->willReturn($message);
+
+    $queue = new TestRabbitMQQueue();
+    $queue->prime('emails', $connection, $channel, totalJobs: 1, noAcknowledgement: true);
+
+    $result = $queue->process(static fn (RabbitMQTestJob $job): null => null);
+
+    self::assertTrue($result->isError());
+    self::assertSame(0, $queue->getTotalJobs());
   }
 
   public function testProcessNacksMalformedDeliveriesBeforeCallingTheProcessor(): void

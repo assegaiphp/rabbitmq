@@ -160,6 +160,10 @@ class RabbitMQQueue implements QueueInterface
         return new RabbitMQQueueProcessResult();
       }
 
+      if ($this->noAcknowledgement) {
+        $this->recordDeliveryRemoved();
+      }
+
       $job = $this->jobCodec->decode(
         $message->getBody(),
         QueueJobTypeResolver::fromCallback($callback),
@@ -169,9 +173,8 @@ class RabbitMQQueue implements QueueInterface
 
       if (!$this->noAcknowledgement) {
         $message->ack();
+        $this->recordDeliveryRemoved();
       }
-
-      $this->totalJobs = max(0, $this->totalJobs - 1);
 
       return new RabbitMQQueueProcessResult(
         data: $data,
@@ -183,6 +186,10 @@ class RabbitMQQueue implements QueueInterface
       if ($message instanceof AMQPMessage && !$this->noAcknowledgement && !$callbackSucceeded) {
         try {
           $message->nack($this->requeueOnFailure);
+
+          if (!$this->requeueOnFailure) {
+            $this->recordDeliveryRemoved();
+          }
         } catch (Throwable $settlementError) {
           $errors[] = $this->queueException('Failed to reject RabbitMQ delivery.', $settlementError);
         }
@@ -279,6 +286,11 @@ class RabbitMQQueue implements QueueInterface
     }
 
     return new QueueException($message . ' ' . $throwable->getMessage(), (int) $throwable->getCode(), $throwable);
+  }
+
+  private function recordDeliveryRemoved(): void
+  {
+    $this->totalJobs = max(0, $this->totalJobs - 1);
   }
 
   private function option(object|array|null $options, string $name, mixed $default): mixed
