@@ -34,7 +34,8 @@ $ composer require assegaiphp/rabbitmq
 
 | RabbitMQ package | AssegaiPHP Common |
 | --- | --- |
-| `>=1.1.1 <2.0` | `^0.10.1` |
+| `>=1.1.2 <2.0` | `^0.10.1` |
+| `1.1.1` | `^0.10.1` |
 | `1.1.0` | `^0.10.0` |
 | `1.0.x` | `^0.9.0` |
 
@@ -79,6 +80,8 @@ return [
 ```
 
 Queue references use the `driver.connection` format, such as `rabbitmq.notifications`.
+
+Creating or injecting a queue is configuration-only. The driver opens the AMQP connection, declares the queue, and configures its exchange binding on the first broker operation. This allows an HTTP application to boot while RabbitMQ is temporarily unavailable; the operation that needs RabbitMQ receives the connection error and a later operation can retry.
 
 Manual acknowledgement is the safe default. A successful processor call acknowledges the delivery. A decoding or processor failure nacks it and requeues it unless `requeue_on_failure` is `false`.
 
