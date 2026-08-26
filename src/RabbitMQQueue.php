@@ -24,18 +24,19 @@ use Throwable;
  */
 class RabbitMQQueue implements QueueInterface
 {
+  public const string DEFAULT_HOST = 'localhost';
   /**
    * @var int The default port for RabbitMQ.
    */
   public const int DEFAULT_PORT = 5672;
   /**
-   * @var AMQPStreamConnection The connection to the RabbitMQ server.
+   * @var AMQPStreamConnection|null The connection to the RabbitMQ server.
    */
-  protected AMQPStreamConnection $connection;
+  protected ?AMQPStreamConnection $connection = null;
   /**
-   * @var AMQPChannel The channel for communication with the RabbitMQ server.
+   * @var AMQPChannel|null The channel for communication with the RabbitMQ server.
    */
-  protected AMQPChannel $channel;
+  protected ?AMQPChannel $channel = null;
   /**
    * @var int The total number of jobs in the queue.
    */
@@ -69,7 +70,6 @@ class RabbitMQQueue implements QueueInterface
    * @param string $exchangeType RabbitMQ exchange type used when exchangeName is configured.
    * @param bool $exchangeDurable Whether the configured exchange survives broker restarts.
    * @param bool $exchangeAutoDelete Whether the configured exchange is deleted after its last binding disappears.
-   * @throws QueueException
    */
   public function __construct(
     protected string $name,
@@ -96,33 +96,7 @@ class RabbitMQQueue implements QueueInterface
   )
   {
     $this->jobCodec = $jobCodec ?? new JsonQueueJobCodec();
-
-    try {
-      $this->logger = new ConsoleLogger(new ConsoleOutput());
-      $this->connection = new AMQPStreamConnection(
-        $this->host,
-        $this->port ?? self::DEFAULT_PORT,
-        $this->username,
-        $this->password,
-        $this->vhost ?? '/'
-      );
-
-      $this->channel = $this->connection->channel();
-      $this->channel->queue_declare($this->name, $this->passive, $this->durable, $this->exclusive, $this->autoDelete);
-
-      if ($this->exchangeName !== '') {
-        $this->channel->exchange_declare(
-          $this->exchangeName,
-          $this->exchangeType,
-          false,
-          $this->exchangeDurable,
-          $this->exchangeAutoDelete,
-        );
-        $this->channel->queue_bind($this->name, $this->exchangeName, $this->routingKey ?? $this->name);
-      }
-    } catch (Throwable $throwable) {
-      throw $this->queueException('Failed to connect to RabbitMQ.', $throwable);
-    }
+    $this->logger = new ConsoleLogger(new ConsoleOutput());
   }
 
   protected QueueJobCodecInterface $jobCodec;
@@ -135,13 +109,7 @@ class RabbitMQQueue implements QueueInterface
    */
   public function __destruct()
   {
-    if (isset($this->channel) && $this->channel->is_open()) {
-      $this->channel->close();
-    }
-
-    if (isset($this->connection) && $this->connection->isConnected()) {
-      $this->connection->close();
-    }
+    $this->closeTransport($this->channel, $this->connection);
   }
 
   /**
@@ -154,7 +122,7 @@ class RabbitMQQueue implements QueueInterface
     $callbackSucceeded = false;
 
     try {
-      $message = $this->channel->basic_get($this->name, $this->noAcknowledgement);
+      $message = $this->channel()->basic_get($this->name, $this->noAcknowledgement);
 
       if (!$message instanceof AMQPMessage) {
         return new RabbitMQQueueProcessResult();
@@ -205,17 +173,22 @@ class RabbitMQQueue implements QueueInterface
    */
   public function add(object $job, object|array|null $options = null): void
   {
-    $messageProperties = [
-      'content_type' => 'application/json',
-      'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT, // Make message persistent
-    ];
-    if ($this->option($options, 'debug', false)) {
-      $this->logger->debug("Adding job to queue '$this->name': " . json_encode($job));
-    }
+    try {
+      $messageProperties = [
+        'content_type' => 'application/json',
+        'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT,
+      ];
 
-    $message = new AMQPMessage($this->jobCodec->encode($job), $messageProperties);
-    $this->channel->basic_publish($message, $this->exchangeName, $this->routingKey ?? $this->name);
-    $this->totalJobs++;
+      if ($this->option($options, 'debug', false)) {
+        $this->logger->debug("Adding job to queue '$this->name': " . json_encode($job));
+      }
+
+      $message = new AMQPMessage($this->jobCodec->encode($job), $messageProperties);
+      $this->channel()->basic_publish($message, $this->exchangeName, $this->routingKey ?? $this->name);
+      $this->totalJobs++;
+    } catch (Throwable $throwable) {
+      throw $this->queueException('Failed to add RabbitMQ job.', $throwable);
+    }
   }
 
   /**
@@ -277,6 +250,89 @@ class RabbitMQQueue implements QueueInterface
       $config['exchange_durable'] ?? true,
       $config['exchange_auto_delete'] ?? false,
     );
+  }
+
+  /**
+   * Returns the active channel, connecting and declaring topology on first use.
+   *
+   * A failed attempt leaves the queue disconnected so a later operation can retry.
+   *
+   * @throws QueueException
+   */
+  protected function channel(): AMQPChannel
+  {
+    if ($this->transportIsOpen() && $this->channel instanceof AMQPChannel) {
+      return $this->channel;
+    }
+
+    $this->closeTransport($this->channel, $this->connection);
+    $this->channel = null;
+    $this->connection = null;
+
+    $connection = null;
+    $channel = null;
+
+    try {
+      $connection = $this->createConnection();
+      $channel = $connection->channel();
+      $channel->queue_declare($this->name, $this->passive, $this->durable, $this->exclusive, $this->autoDelete);
+
+      if ($this->exchangeName !== '') {
+        $channel->exchange_declare(
+          $this->exchangeName,
+          $this->exchangeType,
+          false,
+          $this->exchangeDurable,
+          $this->exchangeAutoDelete,
+        );
+        $channel->queue_bind($this->name, $this->exchangeName, $this->routingKey ?? $this->name);
+      }
+
+      $this->connection = $connection;
+
+      return $this->channel = $channel;
+    } catch (Throwable $throwable) {
+      $this->closeTransport($channel, $connection);
+      throw $this->queueException('Failed to connect to RabbitMQ.', $throwable);
+    }
+  }
+
+  protected function createConnection(): AMQPStreamConnection
+  {
+    return new AMQPStreamConnection(
+      $this->host ?? self::DEFAULT_HOST,
+      $this->port ?? self::DEFAULT_PORT,
+      $this->username,
+      $this->password,
+      $this->vhost ?? '/',
+    );
+  }
+
+  private function transportIsOpen(): bool
+  {
+    try {
+      return $this->channel?->is_open() === true
+        && $this->connection?->isConnected() === true;
+    } catch (Throwable) {
+      return false;
+    }
+  }
+
+  private function closeTransport(?AMQPChannel $channel, ?AMQPStreamConnection $connection): void
+  {
+    try {
+      if ($channel?->is_open()) {
+        $channel->close();
+      }
+    } catch (Throwable) {
+    }
+
+    try {
+      if ($connection?->isConnected()) {
+        $connection->close();
+      }
+    } catch (Throwable) {
+    }
   }
 
   private function queueException(string $message, Throwable $throwable): QueueException

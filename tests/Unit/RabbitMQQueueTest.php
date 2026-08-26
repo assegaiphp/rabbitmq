@@ -14,6 +14,21 @@ use Psr\Log\NullLogger;
 
 final class RabbitMQQueueTest extends TestCase
 {
+  public function testConstructionDefersConnectionAndFailedAttemptsCanRetry(): void
+  {
+    $queue = new FailingConnectionRabbitMQQueue('emails');
+
+    self::assertSame('emails', $queue->getName());
+    self::assertSame(0, $queue->connectionAttempts);
+
+    $first = $queue->process(static fn (RabbitMQTestJob $job): null => null);
+    $second = $queue->process(static fn (RabbitMQTestJob $job): null => null);
+
+    self::assertTrue($first->isError());
+    self::assertTrue($second->isError());
+    self::assertSame(2, $queue->connectionAttempts);
+  }
+
   public function testCreateRequiresAQueueName(): void
   {
     $this->expectException(QueueException::class);
@@ -234,6 +249,22 @@ final readonly class RabbitMQTestJob
   }
 }
 
+final class FailingConnectionRabbitMQQueue extends RabbitMQQueue
+{
+  public int $connectionAttempts = 0;
+
+  protected function createConnection(): AMQPStreamConnection
+  {
+    $this->connectionAttempts++;
+
+    throw new \RuntimeException('RabbitMQ is unavailable.');
+  }
+
+  public function __destruct()
+  {
+  }
+}
+
 final class TestRabbitMQQueue extends RabbitMQQueue
 {
   public function __construct()
@@ -265,6 +296,11 @@ final class TestRabbitMQQueue extends RabbitMQQueue
     $this->requeueOnFailure = $requeueOnFailure;
     $this->routingKey = $routingKey;
     $this->totalJobs = $totalJobs;
+  }
+
+  protected function channel(): AMQPChannel
+  {
+    return $this->channel ?? throw new \LogicException('Test channel was not primed.');
   }
 
   public function __destruct()
