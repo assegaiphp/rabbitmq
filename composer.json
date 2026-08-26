@@ -16,8 +16,7 @@
   ],
   "require": {
     "php": ">=8.4",
-    "ext-amqp": "*",
-    "assegaiphp/common": "^0.10.0",
+    "assegaiphp/common": "^0.10.1",
     "php-amqplib/php-amqplib": "^3.7"
   },
   "require-dev": {

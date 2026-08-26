@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center" style="padding-bottom: 48px">
     <a href="https://assegaiphp.com/" target="blank"><img src="https://assegaiphp.com/images/logos/logo-cropped.png" width="200" alt="Assegai Logo"></a>
 </div>
 
@@ -10,13 +10,11 @@
   <img alt="Status active" src="https://img.shields.io/badge/status-active-10b981?style=flat-square">
 </p>
 
-<p align="center">RabbitMQ queue driver for AssegaiPHP applications.</p>
+<p align="center">RabbitMQ queue support for AssegaiPHP applications.</p>
 
-# AssegaiPHP RabbitMQ Queue Integration
+## Description
 
-This package provides **RabbitMQ queue support** for the [AssegaiPHP](https://assegaiphp.com/) framework. It enables asynchronous job handling using AMQP through PhpAmqpLib.
-
----
+This package integrates [RabbitMQ](https://www.rabbitmq.com/) with AssegaiPHP through [PhpAmqpLib](https://github.com/php-amqplib/php-amqplib). It serializes queued domain jobs, hydrates them for typed processors, and settles deliveries according to the processor outcome.
 
 ## Contribution workflow
 
@@ -24,73 +22,27 @@ For commit and pull request conventions in this repo, see:
 
 - [docs/commit-and-pr-guidelines.md](./docs/commit-and-pr-guidelines.md)
 
----
+## Installation
 
-## 📦 Installation
-
-Install via Composer:
+Install the package with Composer:
 
 ```bash
-composer require assegaiphp/rabbitmq
+$ composer require assegaiphp/rabbitmq
 ```
-
-### RabbitMQ extension requirement
-
-This package currently requires the PHP `amqp` extension.
-
-If Composer stops with an error like this:
-
-```text
-Root composer.json requires PHP extension ext-amqp * but it is missing from your system.
-```
-
-the problem is usually your local PHP CLI setup, not RabbitMQ itself.
-
-Check the PHP environment Composer is using:
-
-```bash
-php --ini
-php -m | grep amqp
-```
-
-If `amqp` is missing, install or enable it for the same PHP version that runs Composer.
 
 ## Compatibility
 
 | RabbitMQ package | AssegaiPHP Common |
 | --- | --- |
-| `1.1.x` | `^0.10.0` |
+| `>=1.1.1 <2.0` | `^0.10.1` |
+| `1.1.0` | `^0.10.0` |
 | `1.0.x` | `^0.9.0` |
 
-Applications moving to the AssegaiPHP 0.10 release line should upgrade this package and the coordinated first-party dependencies together.
+Upgrade this package and its coordinated first-party dependencies together when moving between AssegaiPHP release lines.
 
-On Debian or Ubuntu, that is often:
+## Configuration
 
-```bash
-sudo apt install php-amqp
-```
-
-or a version-specific package such as:
-
-```bash
-sudo apt install php8.5-amqp
-```
-
-If your distribution does not provide a package yet, `pecl` is often the fallback:
-
-```bash
-sudo pecl install amqp
-```
-
-After that, confirm the extension is loaded with `php -m | grep amqp` and rerun Composer.
-
-Avoid installing with `--ignore-platform-req=ext-amqp` for normal development. That bypasses Composer's check, but it does not make the extension available at runtime.
-
----
-
-## ⚙️ Configuration
-
-Update your application's `config/queues.php` file to register the RabbitMQ driver and define your connections:
+Register the driver and its connections in `config/queues.php`:
 
 ```php
 <?php
@@ -110,57 +62,72 @@ return [
         'password' => 'guest',
         'vhost' => '/',
         'exchange_name' => 'notifications',
+        'exchange_type' => 'direct',
+        'exchange_durable' => true,
+        'exchange_auto_delete' => false,
         'routing_key' => 'notifications',
         'passive' => false,
         'durable' => true,
         'exclusive' => false,
         'auto_delete' => false,
+        'no_acknowledgement' => false,
+        'requeue_on_failure' => true,
       ],
     ],
   ],
 ];
 ```
 
-> 📝 **Note**:
->
-> * The `drivers` key maps queue driver names (like `'rabbitmq'`) to their fully qualified class names.
-> * The `connections` key defines queue configurations by driver and queue name (e.g., `'rabbitmq.notifications'`).
+Queue references use the `driver.connection` format, such as `rabbitmq.notifications`.
 
----
+Manual acknowledgement is the safe default. A successful processor call acknowledges the delivery. A decoding or processor failure nacks it and requeues it unless `requeue_on_failure` is `false`.
 
-## ✨ Usage
+When `exchange_name` is non-empty, the driver declares that exchange and binds the queue using `routing_key`. With an empty exchange name, it publishes directly to the queue name.
 
-### Producing Jobs
+## Producing jobs
 
-Inject the queue connection using the `#[InjectQueue]` attribute:
+Inject a configured queue using `#[InjectQueue]` and add a domain job:
 
 ```php
+<?php
+
 use Assegai\Common\Interfaces\Queues\QueueInterface;
 use Assegai\Core\Attributes\Injectable;
 use Assegai\Core\Queues\Attributes\InjectQueue;
+
+final readonly class NotificationJob
+{
+  public function __construct(
+    public string $recipient,
+    public string $message,
+  ) {
+  }
+}
 
 #[Injectable]
 readonly class NotificationsService
 {
   public function __construct(
-    #[InjectQueue('rabbitmq.notifications')] private QueueInterface $queue
+    #[InjectQueue('rabbitmq.notifications')] private QueueInterface $queue,
   ) {
   }
 
-  public function send(object $payload): void
+  public function send(NotificationJob $job): void
   {
-    $this->queue->add($payload);
+    $this->queue->add($job);
   }
 }
 ```
 
----
+The driver writes a versioned JSON envelope containing the job class and payload.
 
-### Consuming Jobs
+## Consuming jobs
 
-Define an injectable processor class for the queue:
+Define an injectable processor whose method declares the job type it accepts:
 
 ```php
+<?php
+
 use Assegai\Core\Attributes\Injectable;
 use Assegai\Core\Queues\Attributes\QueueProcessor;
 
@@ -168,79 +135,62 @@ use Assegai\Core\Queues\Attributes\QueueProcessor;
 #[QueueProcessor('rabbitmq.notifications')]
 final class NotificationsProcessor
 {
-  public function process(object $job): void
+  public function process(NotificationJob $job): void
   {
-    // Handle the job here.
-    // For example: send an email, call another service, or write to the database.
+    // Handle the notification.
   }
 }
 ```
 
-Register that processor in your module's provider list so the CLI can discover it.
+Register the processor in its module's provider list so the Console can discover it. The worker validates the envelope class against the processor parameter and hydrates the domain object before invocation. Legacy JSON messages are hydrated when the processor declares a concrete class; a processor typed only as `object` receives `stdClass`.
 
-If you want a starter file instead of writing the class from scratch, you can scaffold one with:
-
-```bash
-assegai g qp notifications --queue=rabbitmq.notifications
-```
-
-If you already know the job class you want to handle, you can type the generated `process(...)` method too:
+Generate a processor with the Console when you want a starter class:
 
 ```bash
-assegai g qp notifications --queue=rabbitmq.notifications --job=Jobs/NotificationJob
+$ assegai g qp notifications --queue=rabbitmq.notifications
+$ assegai g qp notifications --queue=rabbitmq.notifications --job=Jobs/NotificationJob
 ```
 
-If the feature already has a local `Jobs` folder, you can also use a bare job name:
+## Running workers
+
+Discover and run queue processors with the Assegai Console:
 
 ```bash
-assegai g qp notifications --queue=rabbitmq.notifications --job=notification-job
+$ assegai queue:list
+$ assegai queue:work rabbitmq.notifications
 ```
 
----
-
-### Running the Worker
-
-Use the Assegai queue commands to discover and run processors:
+Process at most one available job and exit with `--once`:
 
 ```bash
-assegai queue:list
-assegai queue:work rabbitmq.notifications
+$ assegai queue:work rabbitmq.notifications --once
 ```
 
-If you want to process one job and exit, use:
+If multiple processors target the same queue, use `--processor` to select one. See the [AssegaiPHP queue guide](https://assegaiphp.com/guide/advanced-topics/queues-and-background-jobs) for application-level worker guidance.
+
+## Testing
+
+Run the package test suite with Composer:
 
 ```bash
-assegai queue:work rabbitmq.notifications --once
+$ composer test
 ```
 
-If more than one processor is registered for the same queue, pass `--processor` to pick one explicitly.
+## Resources
 
-For more information on running workers, refer to the [AssegaiPHP queue guide](https://assegaiphp.com/guide/advanced-topics/queues-and-background-jobs).
+- [RabbitMQ documentation](https://www.rabbitmq.com/documentation.html)
+- [PhpAmqpLib](https://github.com/php-amqplib/php-amqplib)
+- [AssegaiPHP framework](https://github.com/assegaiphp/framework)
 
----
-
-## 🧪 Testing
-
-You can trigger jobs via your API or CLI and observe processing output in the worker terminal.
-
----
-
-## 📚 Resources
-
-* [RabbitMQ Documentation](https://www.rabbitmq.com/documentation.html)
-* [PhpAmqpLib GitHub](https://github.com/php-amqplib/php-amqplib)
-* [AssegaiPHP Framework](https://github.com/assegaiphp/framework)
-
----
 ## Support
 
 Assegai is an MIT-licensed open source project. It can grow thanks to sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://assegaiphp.com/support).
 
 ## Stay in touch
 
-* Author - [Andrew Masiye](https://twitter.com/feenix11)
-* Website - [https://assegaiphp.com](https://assegaiphp.com/)
-* Twitter - [@assegaiphp](https://twitter.com/assegaiphp)
+- Author - [Andrew Masiye](https://twitter.com/feenix11)
+- Website - [https://assegaiphp.com](https://assegaiphp.com/)
+- Twitter - [@assegaiphp](https://twitter.com/assegaiphp)
 
 ## License
 
