@@ -3,20 +3,24 @@
 namespace Assegai\Rabbitmq;
 
 use Assegai\Common\Exceptions\QueueException;
+use Assegai\Common\Interfaces\Queues\QueueJobCodecInterface;
 use Assegai\Common\Interfaces\Queues\QueueInterface;
 use Assegai\Common\Interfaces\Queues\QueueProcessResultInterface;
-use Exception;
+use Assegai\Common\Queues\JsonQueueJobCodec;
+use Assegai\Common\Queues\QueueJobTypeResolver;
 use PhpAmqpLib\Channel\AMQPChannel;
 use PhpAmqpLib\Connection\AMQPStreamConnection;
 use PhpAmqpLib\Message\AMQPMessage;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Logger\ConsoleLogger;
 use Symfony\Component\Console\Output\ConsoleOutput;
+use Throwable;
 
 /**
  * Class RabbitMQQueue
  *
  * Represents a RabbitMQ queue implementation.
+ * @implements QueueInterface<object>
  */
 class RabbitMQQueue implements QueueInterface
 {
@@ -57,8 +61,14 @@ class RabbitMQQueue implements QueueInterface
    * @param string $exchangeName The name of the exchange to which messages will be published.
    * @param string $consumerTag The consumer tag for the queue consumer.
    * @param bool $noLocal Indicates whether the consumer should not receive messages published by itself.
-   * @param bool $noAcknowledgement Indicates whether messages should be acknowledged automatically.
+   * @param bool $noAcknowledgement Indicates whether RabbitMQ should consider deliveries acknowledged immediately.
    * @param bool $noWait Indicates whether the consumer should not wait for a response from the server.
+   * @param QueueJobCodecInterface|null $jobCodec Codec used to serialize and hydrate domain jobs.
+   * @param bool $requeueOnFailure Whether failed deliveries should be returned to the queue.
+   * @param string|null $routingKey Routing key used when publishing; defaults to the queue name.
+   * @param string $exchangeType RabbitMQ exchange type used when exchangeName is configured.
+   * @param bool $exchangeDurable Whether the configured exchange survives broker restarts.
+   * @param bool $exchangeAutoDelete Whether the configured exchange is deleted after its last binding disappears.
    * @throws QueueException
    */
   public function __construct(
@@ -75,10 +85,18 @@ class RabbitMQQueue implements QueueInterface
     protected string $exchangeName = '',
     protected string $consumerTag = '',
     protected bool $noLocal = false,
-    protected bool $noAcknowledgement = true,
+    protected bool $noAcknowledgement = false,
     protected bool $noWait = false,
+    ?QueueJobCodecInterface $jobCodec = null,
+    protected bool $requeueOnFailure = true,
+    protected ?string $routingKey = null,
+    protected string $exchangeType = 'direct',
+    protected bool $exchangeDurable = true,
+    protected bool $exchangeAutoDelete = false,
   )
   {
+    $this->jobCodec = $jobCodec ?? new JsonQueueJobCodec();
+
     try {
       $this->logger = new ConsoleLogger(new ConsoleOutput());
       $this->connection = new AMQPStreamConnection(
@@ -89,24 +107,41 @@ class RabbitMQQueue implements QueueInterface
         $this->vhost ?? '/'
       );
 
-      $this->connection->channel();
       $this->channel = $this->connection->channel();
       $this->channel->queue_declare($this->name, $this->passive, $this->durable, $this->exclusive, $this->autoDelete);
-    } catch (Exception $exception) {
-      throw new QueueException($exception->getMessage(), $exception->getCode(), $exception);
+
+      if ($this->exchangeName !== '') {
+        $this->channel->exchange_declare(
+          $this->exchangeName,
+          $this->exchangeType,
+          false,
+          $this->exchangeDurable,
+          $this->exchangeAutoDelete,
+        );
+        $this->channel->queue_bind($this->name, $this->exchangeName, $this->routingKey ?? $this->name);
+      }
+    } catch (Throwable $throwable) {
+      throw $this->queueException('Failed to connect to RabbitMQ.', $throwable);
     }
   }
+
+  protected QueueJobCodecInterface $jobCodec;
 
   /**
    * RabbitMQQueue destructor.
    *
    * Closes the channel and connection when the object is destroyed.
-   * @throws Exception
+   * @throws Throwable
    */
   public function __destruct()
   {
-    $this->channel->close();
-    $this->connection->close();
+    if (isset($this->channel) && $this->channel->is_open()) {
+      $this->channel->close();
+    }
+
+    if (isset($this->connection) && $this->connection->isConnected()) {
+      $this->connection->close();
+    }
   }
 
   /**
@@ -114,21 +149,54 @@ class RabbitMQQueue implements QueueInterface
    */
   public function process(callable $callback): QueueProcessResultInterface
   {
-    $this->channel->basic_consume($this->name, $this->consumerTag, $this->noLocal, $this->noAcknowledgement, $this->exclusive, $this->noWait, $callback);
+    $message = null;
+    $job = null;
+    $callbackSucceeded = false;
 
     try {
-      $this->channel->consume();
-      $this->totalJobs--;
-      $result = new RabbitMQQueueProcessResult(
-        ['channelId' => $this->channel->getChannelId()],
-      );
-    } catch (Exception $exception) {
-      $result = new RabbitMQQueueProcessResult(
-        errors: [new QueueException("Queue processing failed!", $exception->getCode(), $exception)]
-      );
-    }
+      $message = $this->channel->basic_get($this->name, $this->noAcknowledgement);
 
-    return $result;
+      if (!$message instanceof AMQPMessage) {
+        return new RabbitMQQueueProcessResult();
+      }
+
+      if ($this->noAcknowledgement) {
+        $this->recordDeliveryRemoved();
+      }
+
+      $job = $this->jobCodec->decode(
+        $message->getBody(),
+        QueueJobTypeResolver::fromCallback($callback),
+      );
+      $data = $callback($job);
+      $callbackSucceeded = true;
+
+      if (!$this->noAcknowledgement) {
+        $message->ack();
+        $this->recordDeliveryRemoved();
+      }
+
+      return new RabbitMQQueueProcessResult(
+        data: $data,
+        job: $job,
+      );
+    } catch (Throwable $throwable) {
+      $errors = [$this->queueException('Queue processing failed.', $throwable)];
+
+      if ($message instanceof AMQPMessage && !$this->noAcknowledgement && !$callbackSucceeded) {
+        try {
+          $message->nack($this->requeueOnFailure);
+
+          if (!$this->requeueOnFailure) {
+            $this->recordDeliveryRemoved();
+          }
+        } catch (Throwable $settlementError) {
+          $errors[] = $this->queueException('Failed to reject RabbitMQ delivery.', $settlementError);
+        }
+      }
+
+      return new RabbitMQQueueProcessResult(errors: $errors, job: $job);
+    }
   }
 
   /**
@@ -141,14 +209,12 @@ class RabbitMQQueue implements QueueInterface
       'content_type' => 'application/json',
       'delivery_mode' => AMQPMessage::DELIVERY_MODE_PERSISTENT, // Make message persistent
     ];
-    if (isset($options)) {
-      if ($options['debug'] ?? $options->debug ?? false) {
-        $this->logger->debug("Adding job to queue '$this->name': " . json_encode($job));
-      }
+    if ($this->option($options, 'debug', false)) {
+      $this->logger->debug("Adding job to queue '$this->name': " . json_encode($job));
     }
 
-    $message = new AMQPMessage(json_encode($job) ?: throw new QueueException('Failed to convert Job to JSON string.'), $messageProperties);
-    $this->channel->basic_publish($message, $this->exchangeName, $this->name);
+    $message = new AMQPMessage($this->jobCodec->encode($job), $messageProperties);
+    $this->channel->basic_publish($message, $this->exchangeName, $this->routingKey ?? $this->name);
     $this->totalJobs++;
   }
 
@@ -182,6 +248,12 @@ class RabbitMQQueue implements QueueInterface
       throw new QueueException('Queue name must be a string.');
     }
 
+    $jobCodec = $config['job_codec'] ?? null;
+
+    if ($jobCodec !== null && !$jobCodec instanceof QueueJobCodecInterface) {
+      throw new QueueException('RabbitMQ job_codec must implement QueueJobCodecInterface.');
+    }
+
     return new static(
       $name,
       $config['host'] ?? null,
@@ -192,7 +264,41 @@ class RabbitMQQueue implements QueueInterface
       $config['passive'] ?? false,
       $config['durable'] ?? true,
       $config['exclusive'] ?? false,
-      $config['auto_delete'] ?? false
+      $config['auto_delete'] ?? false,
+      $config['exchange_name'] ?? '',
+      $config['consumer_tag'] ?? '',
+      $config['no_local'] ?? false,
+      $config['no_acknowledgement'] ?? $config['no_ack'] ?? false,
+      $config['no_wait'] ?? false,
+      $jobCodec,
+      $config['requeue_on_failure'] ?? true,
+      $config['routing_key'] ?? null,
+      $config['exchange_type'] ?? 'direct',
+      $config['exchange_durable'] ?? true,
+      $config['exchange_auto_delete'] ?? false,
     );
+  }
+
+  private function queueException(string $message, Throwable $throwable): QueueException
+  {
+    if ($throwable instanceof QueueException) {
+      return $throwable;
+    }
+
+    return new QueueException($message . ' ' . $throwable->getMessage(), (int) $throwable->getCode(), $throwable);
+  }
+
+  private function recordDeliveryRemoved(): void
+  {
+    $this->totalJobs = max(0, $this->totalJobs - 1);
+  }
+
+  private function option(object|array|null $options, string $name, mixed $default): mixed
+  {
+    if (is_array($options)) {
+      return $options[$name] ?? $default;
+    }
+
+    return $options?->{$name} ?? $default;
   }
 }
